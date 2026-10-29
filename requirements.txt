@@ -1,3 +1,4 @@
 flask
 alpaca-py
 gunicorn
+pandas
