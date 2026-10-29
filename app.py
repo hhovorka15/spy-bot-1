@@ -19,31 +19,27 @@ from alpaca.data.enums import DataFeed
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("spy-brain")
 
-# ==========================================
-# 1. MASTER CONFIGURATION (v7.0 GOLD)
-# ==========================================
 SYMBOL = "SPY"
 QTY = int(os.environ.get("TRADE_QTY", "10"))
-CHECK_SECONDS = 30 # Checks TP/SL every 30s, entries on confirmed 5m bar close
-COOLDOWN_MINUTES = 15 # 3 bars (15 mins) cooldown after an exit
+CHECK_SECONDS = 30
+COOLDOWN_MINUTES = 15
 
-# v7.0 Quantitative Parameters
-ADX_THRESH = 22.0 # < 22 = Range (Rubberband MR), >= 22 = Trend (EMA Bounce)
+ADX_THRESH = 22.0
 MR_BAND_MULT = 1.5
 MR_TP_MULT = 0.90
 MR_SL_MULT = 1.75
 TB_TP_MULT = 1.35
 TB_SL_MULT = 1.50
-RATCHET_TRIG = 0.65 # Locks profit at 65% of TP distance
-RATCHET_LOCK = 0.15 # Locks +0.15x ATR above/below entry
+RATCHET_TRIG = 0.65
+RATCHET_LOCK = 0.15
 
 app = Flask(__name__)
 order_lock = threading.Lock()
-brain_lock = threading.Lock()
 ny_tz = ZoneInfo("America/New_York")
 
 bot_state = {
     "last_check": "Not checked yet",
+    "scan_step": "Idle",
     "market_open": False,
     "active_window": "Checking...",
     "spy_price": 0.0,
@@ -63,6 +59,8 @@ bot_state = {
 }
 
 last_exit_ts = 0.0
+last_scan_ts = 0.0
+worker_started = False
 
 
 def get_env_keys():
@@ -80,7 +78,6 @@ def get_clients():
 
 
 def get_position_details(client):
-    """Returns (signed_qty, avg_entry_price)."""
     try:
         pos = client.get_open_position(SYMBOL)
         qty = abs(int(float(pos.qty)))
@@ -100,15 +97,12 @@ def execute_target_position(client, target, reason=""):
         if current == target:
             return "Already at target"
 
-        # Cancel any stuck open orders first
         try:
             client.cancel_orders()
         except Exception:
             pass
 
-        # Close existing position if exiting or flipping sides
         if current != 0 and (target == 0 or (current > 0 and target < 0) or (current < 0 and target > 0)):
-            log.info("Closing position (%s) | Reason: %s", current, reason)
             client.close_position(SYMBOL)
             last_exit_ts = time.time()
             cooldown_dt = datetime.fromtimestamp(last_exit_ts + COOLDOWN_MINUTES * 60, ny_tz)
@@ -123,7 +117,6 @@ def execute_target_position(client, target, reason=""):
                 bot_state["last_action"] = f"Exited ({reason})"
                 return "Flattened"
 
-            # Wait up to 3 seconds for Alpaca to settle the flatten before reversing
             for _ in range(6):
                 time.sleep(0.5)
                 chk_qty, _ = get_position_details(client)
@@ -143,34 +136,27 @@ def execute_target_position(client, target, reason=""):
         )
         bot_state["position"] = target
         bot_state["last_action"] = f"{side.value.upper()} {abs(delta)} ({reason})"
-        log.info("Submitted %s %s %s | Reason: %s", side.value.upper(), abs(delta), SYMBOL, reason)
         return "Order sent"
 
 
-# ==========================================
-# 2. V7.0 CONFIRMED-BAR QUANT ENGINE
-# ==========================================
 def compute_v7_signals(df):
     df = df.copy()
     df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-    # Wilder's ATR(14)
     high_low = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift(1)).abs()
     low_close = (df["low"] - df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # Wilder's RSI(14)
     delta = df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # Wilder's ADX(14)
     up_move = df["high"].diff()
     down_move = -df["low"].diff()
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
@@ -180,13 +166,9 @@ def compute_v7_signals(df):
     dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9))
     df["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-    # Keltner Stretch Bands
     df["upper_band"] = df["ema21"] + (df["atr"] * MR_BAND_MULT)
     df["lower_band"] = df["ema21"] - (df["atr"] * MR_BAND_MULT)
 
-    # CRITICAL FIX:
-    # live_bar (iloc[-1]) = current real-time price for instant TP/SL exits
-    # closed_bar (iloc[-2]) = last officially closed 5m candle for non-repainting entries
     live_bar = df.iloc[-1]
     c = df.iloc[-2]
     prev = df.iloc[-3]
@@ -199,19 +181,16 @@ def compute_v7_signals(df):
     adx_val = float(c["adx"])
     bar_time_str = str(df.index[-2])
 
-    # Candle body/wick strength filter (>= 25%)
     c_range = max(float(c["high"] - c["low"]), 0.01)
     bull_strength = (float(c["close"] - c["low"]) / c_range) >= 0.25
     bear_strength = (float(c["high"] - c["close"]) / c_range) >= 0.25
 
-    # Engine 1: 2-Step Rubberband Mean Reversion (on closed bar)
     was_oversold = (recent3["low"] <= recent3["lower_band"]).any() and (recent3["rsi"] < 42).any()
     was_overbought = (recent3["high"] >= recent3["upper_band"]).any() and (recent3["rsi"] > 58).any()
 
     rb_long = was_oversold and c["close"] > c["open"] and c["close"] > prev["close"] and c["rsi"] > prev["rsi"] and bull_strength
     rb_short = was_overbought and c["close"] < c["open"] and c["close"] < prev["close"] and c["rsi"] < prev["rsi"] and bear_strength
 
-    # Engine 2: EMA Trend Bounce (on closed bar)
     ema_slope_up = ((c["ema21"] - df.iloc[-5]["ema21"]) / (atr_val * 3.0)) >= 0.08
     ema_slope_dn = ((df.iloc[-5]["ema21"] - c["ema21"]) / (atr_val * 3.0)) >= 0.08
 
@@ -238,31 +217,34 @@ def compute_v7_signals(df):
     }
 
 
-# ==========================================
-# 3. SELF-HEALING AUTONOMOUS SCANNER
-# ==========================================
 def run_single_brain_scan():
-    if not brain_lock.acquire(blocking=False):
+    global last_scan_ts
+    # Prevent overlapping scans within 5 seconds
+    if (time.time() - last_scan_ts) < 5.0:
         return
+    last_scan_ts = time.time()
+
     try:
         now_ny = datetime.now(ny_tz)
         bot_state["last_check"] = now_ny.strftime("%Y-%m-%d %I:%M:%S %p %Z")
+        bot_state["scan_step"] = "1. Checking API Keys"
 
         api_key, secret_key, _ = get_env_keys()
         if not api_key or not secret_key:
-            bot_state["regime"] = "Waiting for ALPACA_KEY & ALPACA_SECRET in Render Environment tab"
+            bot_state["regime"] = "Waiting for ALPACA_KEY & ALPACA_SECRET in Render"
             return
 
-        trade_client, data_client = get_clients()
-        clock = trade_client.get_clock()
-        bot_state["market_open"] = bool(clock.is_open)
-
-        # NY Session Windows: Entry (09:35 - 15:45), Force Flatten (15:55 - 16:00)
         hhmm = now_ny.hour * 100 + now_ny.minute
         in_entry_window = 935 <= hhmm <= 1545
         in_eod_flatten = 1555 <= hhmm <= 1600
+
+        bot_state["scan_step"] = "2. Connecting to Alpaca Clock"
+        trade_client, data_client = get_clients()
+        clock = trade_client.get_clock()
+        bot_state["market_open"] = bool(clock.is_open)
         bot_state["active_window"] = "ACTIVE ENTRY WINDOW" if (clock.is_open and in_entry_window) else ("EOD FLATTEN" if (clock.is_open and in_eod_flatten) else "OUTSIDE ENTRY HOURS")
 
+        bot_state["scan_step"] = "3. Downloading SPY 5m Bars (IEX)"
         start_time = datetime.now(timezone.utc) - timedelta(days=6)
         req = StockBarsRequest(
             symbol_or_symbols=SYMBOL,
@@ -274,6 +256,7 @@ def run_single_brain_scan():
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.xs(SYMBOL, level=0)
 
+        bot_state["scan_step"] = f"4. Computing Quant Math ({len(bars)} bars)"
         if len(bars) >= 60:
             sig = compute_v7_signals(bars)
             live_price = sig["live_price"]
@@ -286,10 +269,10 @@ def run_single_brain_scan():
             bot_state["atr"] = round(atr, 2)
             bot_state["regime"] = "TREND (EMA Bounce)" if sig["is_trend"] else "RANGE (Rubberband MR)"
 
+            bot_state["scan_step"] = "5. Checking Open Positions"
             pos, avg_entry = get_position_details(trade_client)
             bot_state["position"] = pos
 
-            # Self-Heal Brackets if Server Restarted While in an Open Trade
             if pos != 0 and bot_state["active_tp"] == 0.0 and avg_entry > 0:
                 tp_mult = TB_TP_MULT if sig["is_trend"] else MR_TP_MULT
                 sl_mult = TB_SL_MULT if sig["is_trend"] else MR_SL_MULT
@@ -300,15 +283,14 @@ def run_single_brain_scan():
                 else:
                     bot_state["active_tp"] = round(avg_entry - atr * tp_mult, 2)
                     bot_state["active_sl"] = round(avg_entry + atr * sl_mult, 2)
-                bot_state["last_action"] = "Restored TP/SL brackets from Alpaca open position"
+                bot_state["last_action"] = "Restored TP/SL brackets from Alpaca"
 
             if clock.is_open:
-                # 1. Force Flatten at 15:55 EST (Zero Overnight Risk)
                 if in_eod_flatten and pos != 0:
                     execute_target_position(trade_client, 0, "15:55 EST EOD Flatten")
+                    bot_state["scan_step"] = "Complete (EOD Flatten)"
                     return
 
-                # 2. Manage Active Long Position
                 if pos > 0 and bot_state["active_tp"] > 0:
                     target_dist = bot_state["active_tp"] - bot_state["entry_price"]
                     if not bot_state["ratchet_locked"] and live_price >= (bot_state["entry_price"] + target_dist * RATCHET_TRIG):
@@ -319,7 +301,6 @@ def run_single_brain_scan():
                     elif live_price <= bot_state["active_sl"]:
                         execute_target_position(trade_client, 0, "Ratchet Lock Hit" if bot_state["ratchet_locked"] else "Stop-Loss Hit")
 
-                # 3. Manage Active Short Position
                 elif pos < 0 and bot_state["active_tp"] > 0:
                     target_dist = bot_state["entry_price"] - bot_state["active_tp"]
                     if not bot_state["ratchet_locked"] and live_price <= (bot_state["entry_price"] - target_dist * RATCHET_TRIG):
@@ -330,7 +311,6 @@ def run_single_brain_scan():
                     elif live_price >= bot_state["active_sl"]:
                         execute_target_position(trade_client, 0, "Ratchet Lock Hit" if bot_state["ratchet_locked"] else "Stop-Loss Hit")
 
-                # 4. Scan for New Loop Entries (Only when Flat, Inside NY Window, Off Cooldown, and New 5m Bar)
                 elif pos == 0 and in_entry_window:
                     in_cooldown = (time.time() - last_exit_ts) < (COOLDOWN_MINUTES * 60)
                     already_traded_bar = (bot_state["last_bar_traded"] == sig["bar_id"])
@@ -355,24 +335,28 @@ def run_single_brain_scan():
                             bot_state["last_bar_traded"] = sig["bar_id"]
                             execute_target_position(trade_client, -QTY, f"SHORT {bot_state['regime']}")
 
+        bot_state["scan_step"] = "Complete (All Data Synced)"
+
     except Exception as e:
         log.exception("Brain scan error: %s", e)
-        bot_state["last_action"] = f"Error: {str(e)[:120]}"
-    finally:
-        brain_lock.release()
+        bot_state["scan_step"] = "Failed with Error"
+        bot_state["last_action"] = f"Error: {str(e)[:140]}"
 
 
 def background_loop():
     while True:
-        run_single_brain_scan()
         time.sleep(CHECK_SECONDS)
-
-
-threading.Thread(target=background_loop, daemon=True).start()
+        run_single_brain_scan()
 
 
 @app.route("/", methods=["GET"])
 def home():
+    global worker_started
+    # Starts the background thread safely INSIDE the forked Gunicorn worker!
+    if not worker_started:
+        worker_started = True
+        threading.Thread(target=background_loop, daemon=True).start()
+
     run_single_brain_scan()
     api_key, secret_key, _ = get_env_keys()
     return jsonify({
