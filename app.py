@@ -1,5 +1,6 @@
 import hmac
 import logging
+import math
 import os
 import re
 import threading
@@ -36,25 +37,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("spy-brain")
 
 # ==========================================
-# 1. MASTER CONFIGURATION (v9.2 STATELESS)
+# 1. MASTER CONFIGURATION (v9.3.1 STATELESS)
 # ==========================================
 SYMBOL = os.environ.get("TRADE_SYMBOL", "SPY").strip().upper()
-QTY = int(os.environ.get("TRADE_QTY", "10"))
 CHECK_SECONDS = int(os.environ.get("CHECK_SECONDS", "30"))
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
 MAX_HOLD_MINUTES = int(os.environ.get("MAX_HOLD_MINUTES", "90"))
 MAX_BAR_AGE_SECONDS = int(os.environ.get("MAX_BAR_AGE_SECONDS", "360"))
 
-# Quantitative Parameters
-ADX_RANGE_MAX = 20.0   # < 20 = Confirmed Range (Rubberband MR)
-ADX_TREND_MIN = 25.0   # >= 25 = Confirmed Trend (EMA + VWAP Bounce)
-MR_BAND_MULT = 1.60
-MR_MIN_TP_MULT = 1.20
-MR_SL_MULT = 1.50
-TB_TP_MULT = 2.25
-TB_SL_MULT = 1.25
-RATCHET_TRIG = 0.75    # Locks profit at 75% of TP distance
-RATCHET_LOCK = 0.35    # Locks +0.35x ATR beyond entry
+# Dynamic Risk & Position Sizing Parameters (Replaces static QTY)
+RISK_MODE = os.environ.get("RISK_MODE", "FIXED_USD").strip().upper()  # "FIXED_USD" or "PCT_EQUITY"
+RISK_USD_PER_TRADE = float(os.environ.get("RISK_USD_PER_TRADE", "50.0"))
+RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.50"))  # 0.50% of equity
+MAX_POSITION_PCT_EQUITY = float(os.environ.get("MAX_POSITION_PCT_EQUITY", "95.0"))
+FALLBACK_QTY = int(os.environ.get("TRADE_QTY", "10"))
+
+# Quantitative Strategy & Multi-Timeframe Filter Parameters
+ADX_TREND_MIN = float(os.environ.get("ADX_TREND_MIN", "25.0"))
+TB_TP_MULT = float(os.environ.get("TB_TP_MULT", "2.25"))  # 1.80 R:R vs 1.25x SL
+TB_SL_MULT = float(os.environ.get("TB_SL_MULT", "1.25"))
+RATCHET_TRIG = float(os.environ.get("RATCHET_TRIG", "0.75"))  # Locks profit at 75% of TP distance
+RATCHET_LOCK = float(os.environ.get("RATCHET_LOCK", "0.35"))  # Locks +0.35x ATR beyond entry
+
+USE_1H_GATE = os.environ.get("USE_1H_GATE", "true").strip().lower() == "true"
+USE_15M_GATE = os.environ.get("USE_15M_GATE", "true").strip().lower() == "true"
+USE_VOL_GATE = os.environ.get("USE_VOL_GATE", "true").strip().lower() == "true"
 
 # Account Risk & Session Controls
 MAX_DAILY_LOSS_USD = float(os.environ.get("MAX_DAILY_LOSS_USD", "150.0"))
@@ -75,12 +82,15 @@ LIVE_STATUSES = {
     "calculated",
 }
 
+ENTRY_COID_REGEX = re.compile(r"^spy-(\d{12})-")
+
 app = Flask(__name__)
-order_lock = threading.RLock()
-brain_lock = threading.Lock()
+# Single reentrant lock prevents lock-ordering deadlocks between webhooks and scanner loop
+bot_lock = threading.RLock()
 ny_tz = ZoneInfo("America/New_York")
 
 bot_state = {
+    "version": "v9.3.1-STATELESS-PROD",
     "last_check": "Not checked yet",
     "market_open": False,
     "active_window": "Checking...",
@@ -89,9 +99,16 @@ bot_state = {
     "last_5m_close": 0.0,
     "session_vwap": 0.0,
     "regime": "Initializing...",
+    "htf_1h_bias": "Initializing...",
+    "htf_15m_structure": "Initializing...",
+    "vol_gate_ok": False,
     "adx": 0.0,
     "rsi": 0.0,
     "atr": 0.0,
+    "risk_mode": RISK_MODE,
+    "risk_budget_usd": RISK_USD_PER_TRADE,
+    "buying_power": 0.0,
+    "next_dynamic_qty": FALLBACK_QTY,
     "position": 0,
     "entry_price": 0.0,
     "active_tp": 0.0,
@@ -107,7 +124,6 @@ bot_state = {
 
 # In-memory flags (reconstructed from Alpaca order history on every scan)
 last_exit_ts = 0.0
-prev_regime_trend = False
 kill_switch = False
 pending_webhook = None
 _clients = None
@@ -137,7 +153,9 @@ def get_clients() -> tuple[TradingClient, StockHistoricalDataClient]:
     if _clients is None:
         api_key, secret_key, paper = get_env_keys()
         if not api_key or not secret_key:
-            raise RuntimeError("Missing ALPACA_API_KEY/ALPACA_KEY or ALPACA_SECRET_KEY/ALPACA_SECRET")
+            raise RuntimeError(
+                "Missing ALPACA_API_KEY/ALPACA_KEY or ALPACA_SECRET_KEY/ALPACA_SECRET"
+            )
         _clients = (
             TradingClient(api_key, secret_key, paper=paper),
             StockHistoricalDataClient(api_key, secret_key),
@@ -154,7 +172,12 @@ def api_call(fn, *args, retries: int = 3, **kwargs):
         except APIError as e:
             code = getattr(e, "status_code", None)
             if code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                log.warning("Transient APIError (%s) in %s; retrying in %.1fs", code, fn.__name__, delay)
+                log.warning(
+                    "Transient APIError (%s) in %s; retrying in %.1fs",
+                    code,
+                    fn.__name__,
+                    delay,
+                )
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -169,14 +192,20 @@ def get_position_details(client: TradingClient) -> tuple[int, float]:
         signed_qty = -qty if pos.side == PositionSide.SHORT else qty
         return signed_qty, float(pos.avg_entry_price)
     except APIError as e:
-        if getattr(e, "status_code", None) == 404 or "position does not exist" in str(e).lower():
+        if (
+            getattr(e, "status_code", None) == 404
+            or "position does not exist" in str(e).lower()
+        ):
             return 0, 0.0
         raise
 
 
 def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
-    """Fetches 5m bars using SIP (with automatic fallback to IEX) plus latest real-time trade price."""
-    start_time = datetime.now(timezone.utc) - timedelta(days=7)
+    """
+    Fetches 25 calendar days of 5m bars using SIP (with automatic fallback to IEX)
+    so resampled 1-Hour 50 EMA (>110 RTH hourly bars) and 15-Minute EMAs have full warmup.
+    """
+    start_time = datetime.now(timezone.utc) - timedelta(days=25)
     feed = DataFeed.SIP if PREFERRED_FEED == "SIP" else DataFeed.IEX
     try:
         req = StockBarsRequest(
@@ -201,6 +230,9 @@ def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
         else:
             raise
 
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(SYMBOL, level=0)
     bars = bars.sort_index()
@@ -209,7 +241,7 @@ def fetch_bars(data_client: StockHistoricalDataClient) -> pd.DataFrame:
         active_feed = DataFeed.IEX if bot_state["data_feed"] == "IEX" else DataFeed.SIP
         t_req = StockLatestTradeRequest(symbol_or_symbols=SYMBOL, feed=active_feed)
         latest = api_call(data_client.get_stock_latest_trade, t_req)
-        if SYMBOL in latest and latest[SYMBOL].price:
+        if SYMBOL in latest and getattr(latest[SYMBOL], "price", None):
             bars.attrs["latest_trade_price"] = float(latest[SYMBOL].price)
     except APIError as e:
         log.debug("Latest trade lookup skipped: %s", e)
@@ -234,11 +266,25 @@ def get_recent_orders(client: TradingClient, after: datetime | None = None) -> l
 
 
 def get_live_orders(client: TradingClient, orders: list | None = None) -> list:
-    orders = orders if orders is not None else get_recent_orders(client)
+    """
+    Queries QueryOrderStatus.OPEN directly when orders is None so resting OCO legs
+    older than the session window are never missed.
+    """
+    if orders is None:
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=[SYMBOL],
+            nested=True,
+            limit=100,
+        )
+        orders = api_call(client.get_orders, req)
+
     out = []
+    seen = set()
     for o in orders:
         for x in [o, *(getattr(o, "legs", None) or [])]:
-            if _v(x.status) in LIVE_STATUSES:
+            if x.id not in seen and _v(x.status) in LIVE_STATUSES:
+                seen.add(x.id)
                 out.append(x)
     return out
 
@@ -284,27 +330,44 @@ def wait_fill(client: TradingClient, order_id, timeout: float = 10.0):
 
 
 def compute_brackets(entry_px: float, direction: int, sig: dict) -> tuple[float, float]:
-    """Calculates dynamic ATR brackets: 1.80 R:R for Trend; EMA21/VWAP structural anchor for MR."""
+    """Calculates dynamic ATR brackets (2.25x ATR TP / 1.25x ATR SL = 1.80 R:R)."""
     atr = sig["atr"]
-    if sig["is_trend"]:
-        tp = round(entry_px + direction * atr * TB_TP_MULT, 2)
-        sl = round(entry_px - direction * atr * TB_SL_MULT, 2)
-    else:
-        min_tp_dist = atr * MR_MIN_TP_MULT
-        forward_dists = [
-            (anchor - entry_px) * direction
-            for anchor in (sig["ema21"], sig["vwap"])
-            if (anchor - entry_px) * direction > 0
-        ]
-        struct_dist = max(forward_dists) if forward_dists else min_tp_dist
-        tp_dist = max(min_tp_dist, min(struct_dist, atr * 1.85))
-        tp = round(entry_px + direction * tp_dist, 2)
-        sl = round(entry_px - direction * atr * MR_SL_MULT, 2)
+    tp = round(entry_px + direction * atr * TB_TP_MULT, 2)
+    sl = round(entry_px - direction * atr * TB_SL_MULT, 2)
     return tp, sl
+
+
+def calculate_dynamic_qty(
+    entry_px: float, sl_px: float, equity: float, buying_power: float = 0.0
+) -> tuple[int, float]:
+    """
+    Calculates dynamic share size from fixed dollar risk or percentage of account equity:
+    Shares = floor(Risk Budget / |Entry - Stop Loss|), capped by both MAX_POSITION_PCT_EQUITY
+    and 95% of available broker buying power.
+    """
+    sl_dist = max(abs(entry_px - sl_px), 0.01)
+    if RISK_MODE == "PCT_EQUITY" and equity > 0:
+        risk_budget = equity * (RISK_PCT_PER_TRADE / 100.0)
+    else:
+        risk_budget = RISK_USD_PER_TRADE
+
+    raw_shares = risk_budget / sl_dist
+    if equity > 0 and entry_px > 0:
+        max_notional = equity * (MAX_POSITION_PCT_EQUITY / 100.0)
+        if buying_power > 0:
+            max_notional = min(max_notional, buying_power * 0.95)
+        max_shares = max_notional / entry_px
+        shares = min(raw_shares, max_shares)
+    else:
+        shares = raw_shares
+
+    qty = max(1, int(math.floor(shares)))
+    return qty, round(risk_budget, 2)
 
 
 def place_oco(client: TradingClient, signed_qty: int, tp: float, sl: float):
     tp, sl = round(tp, 2), round(sl, 2)
+    coid = f"spy-oco-{int(time.time() * 1000) % 1000000}"
     req = LimitOrderRequest(
         symbol=SYMBOL,
         qty=abs(signed_qty),
@@ -314,6 +377,7 @@ def place_oco(client: TradingClient, signed_qty: int, tp: float, sl: float):
         order_class=OrderClass.OCO,
         take_profit=TakeProfitRequest(limit_price=tp),
         stop_loss=StopLossRequest(stop_price=sl),
+        client_order_id=coid,
     )
     return api_call(client.submit_order, req)
 
@@ -321,12 +385,16 @@ def place_oco(client: TradingClient, signed_qty: int, tp: float, sl: float):
 def flatten_position(client: TradingClient, reason: str) -> str:
     """Cancels resting OCO legs and closes any open SPY position at market."""
     global last_exit_ts
-    with order_lock:
+    with bot_lock:
         cancel_symbol_orders(client)
         pos, _ = get_position_details(client)
         if pos == 0:
             bot_state.update(
-                position=0, entry_price=0.0, active_tp=0.0, active_sl=0.0, ratchet_locked=False
+                position=0,
+                entry_price=0.0,
+                active_tp=0.0,
+                active_sl=0.0,
+                ratchet_locked=False,
             )
             return "Already flat"
 
@@ -363,45 +431,63 @@ def sync_broker_state(client: TradingClient, sig: dict, now_ny: datetime) -> tup
     today's trade count, last traded bar, and exit cooldown directly from Alpaca.
     """
     global last_exit_ts
-    with order_lock:
-        session_start = datetime.combine(now_ny.date(), dtime(0, 0), tzinfo=ny_tz).astimezone(timezone.utc)
+    with bot_lock:
+        session_start = datetime.combine(
+            now_ny.date(), dtime(0, 0), tzinfo=ny_tz
+        ).astimezone(timezone.utc)
         orders = get_recent_orders(client, after=session_start - timedelta(hours=12))
         pos, avg_entry = get_position_details(client)
 
         entries_today = 0
         latest_exit_fill_ts = last_exit_ts
         latest_entry_dt = None
+        newest_bar_tag = bot_state["last_bar_traded"]
 
         for o in orders:
             coid = str(getattr(o, "client_order_id", "") or "")
-            if o.filled_at and o.filled_at >= session_start:
-                if coid.startswith("spy-"):
-                    entries_today += 1
-                    m = re.match(r"^spy-(\d{12})-", coid)
-                    if m and not bot_state["last_bar_traded"]:
-                        bot_state["last_bar_traded"] = m.group(1)
+            m = ENTRY_COID_REGEX.match(coid)
+            is_bot_entry = bool(m)
 
-            if pos != 0:
+            if o.filled_at and o.filled_at >= session_start and is_bot_entry:
+                entries_today += 1
+                if m.group(1) > newest_bar_tag:
+                    newest_bar_tag = m.group(1)
+
+            if pos != 0 and o.filled_at:
                 entry_side = "buy" if pos > 0 else "sell"
-                if _v(o.side) == entry_side and o.filled_at:
+                if _v(o.side) == entry_side:
                     if latest_entry_dt is None or o.filled_at > latest_entry_dt:
                         latest_entry_dt = o.filled_at
 
-            for leg in getattr(o, "legs", None) or []:
-                if leg.filled_at and float(leg.filled_qty or 0) > 0:
-                    ts = leg.filled_at.timestamp()
+            # Catch both child-leg exits (BRACKET/OCO) and top-level exits (rebuilt OCO TP or close_position)
+            exit_candidates = list(getattr(o, "legs", None) or [])
+            if not is_bot_entry:
+                exit_candidates.append(o)
+
+            for ex in exit_candidates:
+                if ex.filled_at and float(ex.filled_qty or 0) > 0:
+                    ts = ex.filled_at.timestamp()
                     if ts > latest_exit_fill_ts:
                         latest_exit_fill_ts = ts
                         if pos == 0 and bot_state["position"] != 0:
-                            leg_type = _v(leg.order_type)
+                            leg_type = _v(ex.order_type)
                             exit_label = (
                                 "Take-Profit Hit"
                                 if leg_type == "limit"
-                                else ("Ratchet Lock Hit" if bot_state["ratchet_locked"] else "Stop-Loss Hit")
+                                else (
+                                    "Ratchet Lock Hit"
+                                    if bot_state["ratchet_locked"]
+                                    else "Stop/Market Exit"
+                                )
                             )
                             bot_state["last_action"] = f"Exited ({exit_label})"
-                            log.info("Detected broker-side exit: %s @ %s", exit_label, leg.filled_avg_price)
+                            log.info(
+                                "Detected broker-side exit: %s @ %s",
+                                exit_label,
+                                ex.filled_avg_price,
+                            )
 
+        bot_state["last_bar_traded"] = newest_bar_tag
         last_exit_ts = max(last_exit_ts, latest_exit_fill_ts)
         bot_state["trades_today"] = entries_today
         until = last_exit_ts + COOLDOWN_MINUTES * 60
@@ -412,15 +498,20 @@ def sync_broker_state(client: TradingClient, sig: dict, now_ny: datetime) -> tup
         )
 
         if pos == 0:
-            if get_live_orders(client, orders):
+            if get_live_orders(client):
                 cancel_symbol_orders(client)
             bot_state.update(
-                position=0, entry_price=0.0, active_tp=0.0, active_sl=0.0, ratchet_locked=False
+                position=0,
+                entry_price=0.0,
+                active_tp=0.0,
+                active_sl=0.0,
+                ratchet_locked=False,
             )
             return 0, None, None, None
 
         direction = 1 if pos > 0 else -1
-        tp_leg, sl_leg = find_exit_legs(client, orders)
+        # Query live open orders directly so carried-over positions >12h old are never missed
+        tp_leg, sl_leg = find_exit_legs(client)
 
         # Self-heal missing broker OCO brackets if restarted or adopted mid-trade
         if not (tp_leg and sl_leg):
@@ -431,7 +522,13 @@ def sync_broker_state(client: TradingClient, sig: dict, now_ny: datetime) -> tup
                     break
             if not (tp_leg and sl_leg):
                 tp, sl = compute_brackets(avg_entry, direction, sig)
-                log.warning("Rebuilding missing OCO legs for %+d %s: TP=%s SL=%s", pos, SYMBOL, tp, sl)
+                log.warning(
+                    "Rebuilding missing OCO legs for %+d %s: TP=%s SL=%s",
+                    pos,
+                    SYMBOL,
+                    tp,
+                    sl,
+                )
                 cancel_symbol_orders(client)
                 try:
                     place_oco(client, pos, tp, sl)
@@ -457,18 +554,33 @@ def sync_broker_state(client: TradingClient, sig: dict, now_ny: datetime) -> tup
 
 
 def enter_bracket_trade(
-    client: TradingClient, sig: dict, direction: int, label: str, manual: bool = False
+    client: TradingClient,
+    sig: dict,
+    direction: int,
+    label: str,
+    equity: float,
+    buying_power: float,
+    manual: bool = False,
 ) -> str:
-    """Submits an atomic broker-side BRACKET order and re-anchors legs on fill slippage."""
-    with order_lock:
+    """
+    Calculates dynamic risk-based share quantity, submits an atomic broker-side
+    BRACKET order, verifies post-timeout fill status, and re-anchors legs on slippage.
+    """
+    with bot_lock:
         if get_position_details(client)[0] != 0:
             return "Already in position"
         cancel_symbol_orders(client)
 
         px = sig["live_price"]
         tp, sl = compute_brackets(px, direction, sig)
+        qty, risk_budget = calculate_dynamic_qty(px, sl, equity, buying_power)
+        bot_state["next_dynamic_qty"] = qty
+        bot_state["risk_budget_usd"] = risk_budget
+
         bar_tag = sig["bar_tag"]
-        coid = f"spy-{bar_tag}-{'L' if direction > 0 else 'S'}{'M' if manual else 'A'}"
+        # Unique millisecond suffix prevents 422 client_order_id collision on manual re-entries
+        unique_suffix = int(time.time() * 1000) % 100000
+        coid = f"spy-{bar_tag}-{'L' if direction > 0 else 'S'}{'M' if manual else 'A'}-{unique_suffix}"
         bot_state["last_bar_traded"] = bar_tag
 
         try:
@@ -476,7 +588,7 @@ def enter_bracket_trade(
                 client.submit_order,
                 MarketOrderRequest(
                     symbol=SYMBOL,
-                    qty=QTY,
+                    qty=qty,
                     side=OrderSide.BUY if direction > 0 else OrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
                     order_class=OrderClass.BRACKET,
@@ -495,7 +607,9 @@ def enter_bracket_trade(
                 api_call(client.cancel_order_by_id, parent.id, retries=1)
             except APIError:
                 pass
+            time.sleep(0.4)
 
+        # Post-timeout verification prevents naked partial fills
         pos, avg_entry = get_position_details(client)
         if pos == 0:
             cancel_symbol_orders(client)
@@ -503,27 +617,45 @@ def enter_bracket_trade(
 
         actual_tp, actual_sl = compute_brackets(avg_entry, direction, sig)
         tp_leg, sl_leg = find_exit_legs(client)
-        if abs(avg_entry - px) >= 0.05:
-            if sl_leg:
+
+        # Ensure OCO protection is intact if partial fill or race condition occurred
+        if not (tp_leg and sl_leg):
+            cancel_symbol_orders(client)
+            try:
+                place_oco(client, pos, actual_tp, actual_sl)
+                tp, sl = actual_tp, actual_sl
+            except APIError as e:
+                log.error("CRITICAL: Failed to attach OCO after fill (%s); flattening", e)
+                flatten_position(client, "Missing OCO on Entry")
+                return "Emergency flattened"
+        elif abs(avg_entry - px) >= 0.05:
+            # Re-anchor both legs on slippage; if either replace fails, rebuild atomic OCO
+            replace_ok = True
+            try:
+                api_call(
+                    client.replace_order_by_id,
+                    sl_leg.id,
+                    ReplaceOrderRequest(stop_price=actual_sl),
+                )
+                api_call(
+                    client.replace_order_by_id,
+                    tp_leg.id,
+                    ReplaceOrderRequest(limit_price=actual_tp),
+                )
+                tp, sl = actual_tp, actual_sl
+            except APIError as e:
+                log.warning("Leg replace failed on slippage (%s); rebuilding atomic OCO", e)
+                replace_ok = False
+
+            if not replace_ok:
+                cancel_symbol_orders(client)
                 try:
-                    api_call(
-                        client.replace_order_by_id,
-                        sl_leg.id,
-                        ReplaceOrderRequest(stop_price=actual_sl),
-                    )
-                    sl = actual_sl
-                except APIError as e:
-                    log.warning("Could not re-anchor SL to fill price: %s", e)
-            if tp_leg:
-                try:
-                    api_call(
-                        client.replace_order_by_id,
-                        tp_leg.id,
-                        ReplaceOrderRequest(limit_price=actual_tp),
-                    )
-                    tp = actual_tp
-                except APIError as e:
-                    log.warning("Could not re-anchor TP to fill price: %s", e)
+                    place_oco(client, pos, actual_tp, actual_sl)
+                    tp, sl = actual_tp, actual_sl
+                except APIError as e2:
+                    log.error("Atomic OCO rebuild failed (%s); flattening", e2)
+                    flatten_position(client, "Slippage OCO Rebuild Failed")
+                    return "Emergency flattened"
 
         bot_state.update(
             position=pos,
@@ -531,9 +663,18 @@ def enter_bracket_trade(
             active_tp=tp,
             active_sl=sl,
             ratchet_locked=False,
-            last_action=f"{label} {pos:+d} @ {avg_entry:.2f}",
+            last_action=f"{label} {pos:+d} sh @ {avg_entry:.2f} (Risk ${risk_budget:.0f})",
         )
-        log.info("ENTERED %s: %+d %s @ %.2f | TP=%.2f | SL=%.2f", label, pos, SYMBOL, avg_entry, tp, sl)
+        log.info(
+            "ENTERED %s: %+d %s @ %.2f | TP=%.2f | SL=%.2f | RiskBudget=$%.2f",
+            label,
+            pos,
+            SYMBOL,
+            avg_entry,
+            tp,
+            sl,
+            risk_budget,
+        )
         return "Order sent"
 
 
@@ -567,6 +708,10 @@ def manage_open_position(
         bot_state["ratchet_locked"] = True
         return
 
+    # Ensure $0.05 market-price clearance so Alpaca never rejects stop replacement with 422
+    if (live_price - new_sl) * direction < 0.05:
+        return
+
     try:
         api_call(
             client.replace_order_by_id,
@@ -581,140 +726,212 @@ def manage_open_position(
         log.warning("Ratchet replace_order failed (will retry next scan): %s", e)
 
 
-def check_risk_gate(client: TradingClient) -> tuple[bool, str]:
-    if kill_switch:
-        return False, "Kill switch active"
+def check_risk_gate(client: TradingClient) -> tuple[bool, str, float, float]:
+    """Returns (risk_ok, status_msg, account_equity, buying_power)."""
     acct = api_call(client.get_account)
-    day_pnl = float(acct.equity) - float(acct.last_equity)
+    equity = float(acct.equity)
+    buying_power = float(getattr(acct, "buying_power", equity) or equity)
+    day_pnl = equity - float(acct.last_equity)
     bot_state["day_pnl"] = round(day_pnl, 2)
+    bot_state["buying_power"] = round(buying_power, 2)
+
+    if kill_switch:
+        return False, "Kill switch active", equity, buying_power
     if day_pnl <= -MAX_DAILY_LOSS_USD:
-        return False, f"Daily loss cap hit (${day_pnl:.2f})"
+        return False, f"Daily loss cap hit (${day_pnl:.2f})", equity, buying_power
     if bot_state["trades_today"] >= MAX_TRADES_PER_DAY:
-        return False, f"Max trades/day ({bot_state['trades_today']}/{MAX_TRADES_PER_DAY})"
-    return True, "OK"
+        return (
+            False,
+            f"Max trades/day ({bot_state['trades_today']}/{MAX_TRADES_PER_DAY})",
+            equity,
+            buying_power,
+        )
+    return True, "OK", equity, buying_power
 
 
 # ==========================================
-# 4. V9.2 CONFIRMED-BAR QUANT ENGINE
+# 4. V9.3.1 MULTI-TIMEFRAME QUANT ENGINE
 # ==========================================
-def compute_signals(df: pd.DataFrame, prev_trend: bool = False) -> dict:
+def compute_signals(df: pd.DataFrame) -> dict | None:
+    """
+    Computes strictly closed-bar 5m, 15m, and 1h indicators and evaluates:
+      - Engine 1: EMA + Session VWAP Trend Pullback
+      - Engine 2: Session VWAP Reclaim / Rejection
+    """
     df = df.copy()
     latest_trade_px = df.attrs.get("latest_trade_price")
     now_utc = datetime.now(timezone.utc)
 
-    # Filter strictly to Regular Trading Hours (09:30 - 16:00 ET) so overnight gaps don't skew ATR/EMA
+    # 1. Filter strictly to Regular Trading Hours (09:30 - 16:00 ET)
     df.index = df.index.tz_convert(ny_tz)
     rth_mask = (df.index.time >= dtime(9, 30)) & (df.index.time < dtime(16, 0))
     df_rth = df.loc[rth_mask].copy()
     if len(df_rth) >= 60:
         df = df_rth
 
-    # Session-Anchored Intraday VWAP (resets daily at 09:30 ET)
-    tp_bar = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = tp_bar * df["volume"]
-    session_dates = df.index.date
-    df["vwap"] = pv.groupby(session_dates).cumsum() / df["volume"].replace(0, 1).groupby(session_dates).cumsum()
+    live_price = (
+        float(latest_trade_px) if latest_trade_px else float(df.iloc[-1]["close"])
+    )
 
-    df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    # 2. Slice to strictly CLOSED 5-minute bars FIRST to eliminate forming-bar lookahead bias
+    last_bar_close_utc = df.index[-1].astimezone(timezone.utc) + timedelta(minutes=5)
+    confirmed_df = df.iloc[:-1].copy() if last_bar_close_utc > now_utc else df.copy()
+    if len(confirmed_df) < 30:
+        return None
+
+    # 3. Resample closed 5m RTH bars into 15-Minute and 1-Hour timeframes (zero extra API calls)
+    df_15m = (
+        confirmed_df.resample("15min", closed="left", label="left")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna()
+    )
+    if (
+        len(df_15m) > 1
+        and (df_15m.index[-1].astimezone(timezone.utc) + timedelta(minutes=15)) > now_utc
+    ):
+        df_15m = df_15m.iloc[:-1].copy()
+
+    df_1h = (
+        confirmed_df.resample("1h", closed="left", label="left")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }
+        )
+        .dropna()
+    )
+    if (
+        len(df_1h) > 1
+        and (df_1h.index[-1].astimezone(timezone.utc) + timedelta(hours=1)) > now_utc
+    ):
+        df_1h = df_1h.iloc[:-1].copy()
+
+    if len(df_15m) < 5 or len(df_1h) < 2:
+        return None
+
+    df_15m["ema9"] = df_15m["close"].ewm(span=9, adjust=False).mean()
+    df_15m["ema21"] = df_15m["close"].ewm(span=21, adjust=False).mean()
+    df_1h["ema50"] = df_1h["close"].ewm(span=50, adjust=False).mean()
+
+    # Evaluate Higher-Timeframe Gates
+    htf_1h_close = float(df_1h.iloc[-1]["close"])
+    htf_1h_ema50 = float(df_1h.iloc[-1]["ema50"])
+    gate_1h_long = (not USE_1H_GATE) or (htf_1h_close > htf_1h_ema50)
+    gate_1h_short = (not USE_1H_GATE) or (htf_1h_close < htf_1h_ema50)
+
+    htf_15m_close = float(df_15m.iloc[-1]["close"])
+    htf_15m_ema9 = float(df_15m.iloc[-1]["ema9"])
+    htf_15m_ema21 = float(df_15m.iloc[-1]["ema21"])
+    gate_15m_long = (not USE_15M_GATE) or (
+        htf_15m_close > htf_15m_ema21 and htf_15m_ema9 > htf_15m_ema21
+    )
+    gate_15m_short = (not USE_15M_GATE) or (
+        htf_15m_close < htf_15m_ema21 and htf_15m_ema9 < htf_15m_ema21
+    )
+
+    mtf_bull_aligned = gate_1h_long and gate_15m_long
+    mtf_bear_aligned = gate_1h_short and gate_15m_short
+
+    # 4. Compute 5-Minute Confirmed Indicators
+    tp_bar = (confirmed_df["high"] + confirmed_df["low"] + confirmed_df["close"]) / 3.0
+    pv = tp_bar * confirmed_df["volume"]
+    session_dates = confirmed_df.index.date
+    confirmed_df["vwap"] = (
+        pv.groupby(session_dates).cumsum()
+        / confirmed_df["volume"].replace(0, 1).groupby(session_dates).cumsum()
+    )
+
+    confirmed_df["ema9"] = confirmed_df["close"].ewm(span=9, adjust=False).mean()
+    confirmed_df["ema21"] = confirmed_df["close"].ewm(span=21, adjust=False).mean()
+    confirmed_df["ema50"] = confirmed_df["close"].ewm(span=50, adjust=False).mean()
+    confirmed_df["vol_sma20"] = confirmed_df["volume"].rolling(20, min_periods=1).mean()
 
     # Wilder's ATR(14)
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift(1)).abs()
-    low_close = (df["low"] - df["close"].shift(1)).abs()
+    high_low = confirmed_df["high"] - confirmed_df["low"]
+    high_close = (confirmed_df["high"] - confirmed_df["close"].shift(1)).abs()
+    low_close = (confirmed_df["low"] - confirmed_df["close"].shift(1)).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+    confirmed_df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
     # Wilder's RSI(14)
-    delta = df["close"].diff()
+    delta = confirmed_df["close"].diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, 1e-9)
-    df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
+    confirmed_df["rsi"] = 100.0 - (100.0 / (1.0 + rs))
 
     # Wilder's ADX(14)
-    up_move = df["high"].diff()
-    down_move = -df["low"].diff()
+    up_move = confirmed_df["high"].diff()
+    down_move = -confirmed_df["low"].diff()
     plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-    plus_di = 100.0 * (plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / df["atr"].replace(0, 1e-9))
-    minus_di = 100.0 * (minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / df["atr"].replace(0, 1e-9))
+    atr_safe = confirmed_df["atr"].replace(0, 1e-9)
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe)
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr_safe)
     dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1e-9)
-    df["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean()
-
-    # Keltner Stretch Bands
-    df["upper_band"] = df["ema21"] + (df["atr"] * MR_BAND_MULT)
-    df["lower_band"] = df["ema21"] - (df["atr"] * MR_BAND_MULT)
-
-    # Timestamp-Verified Closed-Bar Selection
-    last_bar_close_utc = df.index[-1].astimezone(timezone.utc) + timedelta(minutes=5)
-    confirmed_df = df.iloc[:-1] if last_bar_close_utc > now_utc else df
+    confirmed_df["adx"] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0.0)
 
     c = confirmed_df.iloc[-1]
     prev = confirmed_df.iloc[-2]
-    recent3 = confirmed_df.iloc[-3:]
+    c_time = confirmed_df.index[-1]
+    prev_time = confirmed_df.index[-2]
 
-    c_close_utc = confirmed_df.index[-1].astimezone(timezone.utc) + timedelta(minutes=5)
-    bar_is_fresh = max(0.0, (now_utc - c_close_utc).total_seconds()) <= MAX_BAR_AGE_SECONDS
+    c_close_utc = c_time.astimezone(timezone.utc) + timedelta(minutes=5)
+    bar_is_fresh = (
+        max(0.0, (now_utc - c_close_utc).total_seconds()) <= MAX_BAR_AGE_SECONDS
+    )
 
-    live_price = float(latest_trade_px) if latest_trade_px else float(df.iloc[-1]["close"])
     closed_price = float(c["close"])
     atr_val = max(float(c["atr"]), 0.05)
     rsi_val = float(c["rsi"])
     adx_val = float(c["adx"])
     vwap_val = float(c["vwap"])
     ema21_val = float(c["ema21"])
-    bar_tag = confirmed_df.index[-1].strftime("%Y%m%d%H%M")
+    bar_tag = c_time.strftime("%Y%m%d%H%M")
 
-    # ADX Hysteresis Deadband
-    if adx_val >= ADX_TREND_MIN:
-        is_trend = True
-    elif adx_val < ADX_RANGE_MAX:
-        is_trend = False
-    else:
-        is_trend = prev_trend
-
+    # Volume Gate & Volatility Shock Filter (exempts 09:30 opening print)
+    vol_ok = (not USE_VOL_GATE) or (float(c["volume"]) > float(c["vol_sma20"]))
     bar_range = float(c["high"] - c["low"])
-    vol_shock = bar_range > (atr_val * 2.5)
+    is_open_bar = c_time.hour == 9 and c_time.minute == 30
+    vol_shock = (bar_range > (atr_val * 2.5)) and not is_open_bar
     c_range = max(bar_range, 0.01)
-    bull_strength = (float(c["close"] - c["low"]) / c_range) >= 0.30
-    bear_strength = (float(c["high"] - c["close"]) / c_range) >= 0.30
 
-    # Engine 1: 2-Step Rubberband Mean Reversion
-    was_oversold = (recent3["low"] <= recent3["lower_band"]).any() and (recent3["rsi"] < 40).any()
-    was_overbought = (recent3["high"] >= recent3["upper_band"]).any() and (recent3["rsi"] > 60).any()
+    bull_body_strength = (float(c["close"] - c["low"]) / c_range) >= 0.55
+    bear_body_strength = (float(c["high"] - c["close"]) / c_range) >= 0.55
 
-    rb_long = (
-        bar_is_fresh
-        and not vol_shock
-        and was_oversold
-        and c["close"] > c["open"]
-        and c["close"] > prev["close"]
-        and c["rsi"] > prev["rsi"]
-        and bull_strength
+    # --- Engine 1: EMA + Session VWAP Trend Pullback ---
+    ema_slope_up = (
+        (c["ema21"] - confirmed_df.iloc[-4]["ema21"]) / (atr_val * 3.0)
+    ) >= 0.08
+    ema_slope_dn = (
+        (confirmed_df.iloc[-4]["ema21"] - c["ema21"]) / (atr_val * 3.0)
+    ) >= 0.08
+
+    touched_pb_long = c["low"] <= (c["ema21"] + atr_val * 0.15) and c["low"] >= (
+        c["ema50"] - atr_val * 0.25
     )
-    rb_short = (
-        bar_is_fresh
-        and not vol_shock
-        and was_overbought
-        and c["close"] < c["open"]
-        and c["close"] < prev["close"]
-        and c["rsi"] < prev["rsi"]
-        and bear_strength
-        and c["close"] < vwap_val
+    touched_pb_short = c["high"] >= (c["ema21"] - atr_val * 0.15) and c["high"] <= (
+        c["ema50"] + atr_val * 0.25
     )
-
-    # Engine 2: EMA + Session VWAP Trend Bounce
-    ema_slope_up = ((c["ema21"] - confirmed_df.iloc[-4]["ema21"]) / (atr_val * 3.0)) >= 0.08
-    ema_slope_dn = ((confirmed_df.iloc[-4]["ema21"] - c["ema21"]) / (atr_val * 3.0)) >= 0.08
-
-    touched_pb_long = c["low"] <= (c["ema21"] + atr_val * 0.15) and c["low"] >= (c["ema50"] - atr_val * 0.25)
-    touched_pb_short = c["high"] >= (c["ema21"] - atr_val * 0.15) and c["high"] <= (c["ema50"] + atr_val * 0.25)
 
     tb_long = (
         bar_is_fresh
         and not vol_shock
+        and vol_ok
+        and mtf_bull_aligned
+        and adx_val >= ADX_TREND_MIN
         and c["ema9"] > c["ema21"]
         and c["close"] > c["ema50"]
         and c["close"] > vwap_val
@@ -727,6 +944,9 @@ def compute_signals(df: pd.DataFrame, prev_trend: bool = False) -> dict:
     tb_short = (
         bar_is_fresh
         and not vol_shock
+        and vol_ok
+        and mtf_bear_aligned
+        and adx_val >= ADX_TREND_MIN
         and c["ema9"] < c["ema21"]
         and c["close"] < c["ema50"]
         and c["close"] < vwap_val
@@ -737,8 +957,51 @@ def compute_signals(df: pd.DataFrame, prev_trend: bool = False) -> dict:
         and 28 < rsi_val < 55
     )
 
-    long_sig = tb_long if is_trend else rb_long
-    short_sig = tb_short if is_trend else rb_short
+    # --- Engine 2: Session VWAP Reclaim / Rejection (Same-Session Guarded) ---
+    same_session = c_time.date() == prev_time.date()
+    vwap_cross_up = (
+        same_session and (prev["close"] <= prev["vwap"]) and (c["close"] > vwap_val)
+    )
+    vwap_cross_dn = (
+        same_session and (prev["close"] >= prev["vwap"]) and (c["close"] < vwap_val)
+    )
+
+    vwap_reclaim_long = (
+        bar_is_fresh
+        and not vol_shock
+        and vol_ok
+        and mtf_bull_aligned
+        and vwap_cross_up
+        and c["close"] > c["open"]
+        and c["close"] > c["ema9"]
+        and bull_body_strength
+        and 48 < rsi_val < 72
+    )
+    vwap_reject_short = (
+        bar_is_fresh
+        and not vol_shock
+        and vol_ok
+        and mtf_bear_aligned
+        and vwap_cross_dn
+        and c["close"] < c["open"]
+        and c["close"] < c["ema9"]
+        and bear_body_strength
+        and 28 < rsi_val < 52
+    )
+
+    long_sig = bool(tb_long or vwap_reclaim_long)
+    short_sig = bool(tb_short or vwap_reject_short)
+
+    if tb_long:
+        sig_label = "LONG (EMA+VWAP Pullback)"
+    elif vwap_reclaim_long:
+        sig_label = "LONG (VWAP Reclaim)"
+    elif tb_short:
+        sig_label = "SHORT (EMA+VWAP Pullback)"
+    elif vwap_reject_short:
+        sig_label = "SHORT (VWAP Rejection)"
+    else:
+        sig_label = "TREND_PULLBACK" if adx_val >= ADX_TREND_MIN else "VWAP_WATCH"
 
     return {
         "live_price": live_price,
@@ -748,9 +1011,18 @@ def compute_signals(df: pd.DataFrame, prev_trend: bool = False) -> dict:
         "adx": adx_val,
         "vwap": vwap_val,
         "ema21": ema21_val,
-        "is_trend": is_trend,
-        "long_sig": bool(long_sig),
-        "short_sig": bool(short_sig),
+        "htf_1h_bias": (
+            "BULLISH (Long Only)" if gate_1h_long else "BEARISH (Short Only)"
+        ),
+        "htf_15m_structure": (
+            "BULL ALIGNED"
+            if gate_15m_long
+            else ("BEAR ALIGNED" if gate_15m_short else "MIXED / CHOP")
+        ),
+        "vol_ok": bool(vol_ok),
+        "long_sig": long_sig,
+        "short_sig": short_sig,
+        "sig_label": sig_label,
         "bar_tag": bar_tag,
     }
 
@@ -759,8 +1031,8 @@ def compute_signals(df: pd.DataFrame, prev_trend: bool = False) -> dict:
 # 5. SELF-HEALING AUTONOMOUS SCANNER
 # ==========================================
 def run_single_brain_scan():
-    global prev_regime_trend, pending_webhook
-    if not brain_lock.acquire(blocking=False):
+    global pending_webhook
+    if not bot_lock.acquire(blocking=False):
         return
     try:
         now_ny = datetime.now(ny_tz)
@@ -775,11 +1047,13 @@ def run_single_brain_scan():
         clock = api_call(trade_client.get_clock)
         is_open = bool(clock.is_open)
         mins_to_close = (
-            (clock.next_close - clock.timestamp).total_seconds() / 60.0 if is_open else None
+            (clock.next_close - clock.timestamp).total_seconds() / 60.0
+            if is_open
+            else None
         )
         hhmm = now_ny.hour * 100 + now_ny.minute
 
-        # Dynamic close handling (automatically handles 13:00 EST half-days via clock.next_close)
+        # Dynamic close handling (automatically handles 13:00 ET half-days via clock.next_close)
         in_entry_window = (
             is_open
             and hhmm >= 940
@@ -800,8 +1074,9 @@ def run_single_brain_scan():
         if len(bars) < 60:
             return
 
-        sig = compute_signals(bars, prev_trend=prev_regime_trend)
-        prev_regime_trend = sig["is_trend"]
+        sig = compute_signals(bars)
+        if sig is None:
+            return
 
         bot_state.update(
             spy_price=round(sig["live_price"], 2),
@@ -810,15 +1085,30 @@ def run_single_brain_scan():
             rsi=round(sig["rsi"], 1),
             adx=round(sig["adx"], 1),
             atr=round(sig["atr"], 2),
-            regime="TREND (EMA+VWAP Bounce)" if sig["is_trend"] else "RANGE (Rubberband MR)",
+            htf_1h_bias=sig["htf_1h_bias"],
+            htf_15m_structure=sig["htf_15m_structure"],
+            vol_gate_ok=sig["vol_ok"],
+            regime=(
+                "TREND ACTIVE (EMA Pullback + VWAP)"
+                if sig["adx"] >= ADX_TREND_MIN
+                else "INFLECTION WATCH (VWAP Reclaim/Reject)"
+            ),
         )
 
         pos, tp_leg, sl_leg, entry_dt = sync_broker_state(trade_client, sig, now_ny)
+        ok, risk_msg, equity, buying_power = check_risk_gate(trade_client)
+        bot_state["risk_status"] = risk_msg
+
+        # Preview next dynamic share count in telemetry dashboard
+        _, preview_sl = compute_brackets(sig["live_price"], 1, sig)
+        preview_qty, preview_budget = calculate_dynamic_qty(
+            sig["live_price"], preview_sl, equity, buying_power
+        )
+        bot_state["next_dynamic_qty"] = preview_qty
+        bot_state["risk_budget_usd"] = preview_budget
+
         if not is_open:
             return
-
-        ok, risk_msg = check_risk_gate(trade_client)
-        bot_state["risk_status"] = risk_msg
 
         if pos != 0:
             if in_eod_flatten:
@@ -827,7 +1117,13 @@ def run_single_brain_scan():
                 flatten_position(trade_client, f"Risk Halt ({risk_msg})")
             else:
                 manage_open_position(
-                    trade_client, pos, tp_leg, sl_leg, entry_dt, sig["live_price"], sig["atr"]
+                    trade_client,
+                    pos,
+                    tp_leg,
+                    sl_leg,
+                    entry_dt,
+                    sig["live_price"],
+                    sig["atr"],
                 )
             return
 
@@ -842,12 +1138,20 @@ def run_single_brain_scan():
                 pending_webhook = None
             elif not in_cooldown and not already_traded_bar:
                 if sig["long_sig"]:
-                    direction, label = 1, f"LONG {bot_state['regime']}"
+                    direction, label = 1, sig["sig_label"]
                 elif sig["short_sig"]:
-                    direction, label = -1, f"SHORT {bot_state['regime']}"
+                    direction, label = -1, sig["sig_label"]
 
             if direction != 0:
-                enter_bracket_trade(trade_client, sig, direction, label, manual=manual)
+                enter_bracket_trade(
+                    trade_client,
+                    sig,
+                    direction,
+                    label,
+                    equity,
+                    buying_power,
+                    manual=manual,
+                )
 
     except APIError as e:
         log.error("Alpaca APIError in brain scan: %s", e)
@@ -856,7 +1160,7 @@ def run_single_brain_scan():
         log.exception("Brain scan error: %s", e)
         bot_state["last_action"] = f"Error: {str(e)[:120]}"
     finally:
-        brain_lock.release()
+        bot_lock.release()
 
 
 def background_loop():
@@ -869,7 +1173,9 @@ def start_worker_once():
     global worker_started
     if not worker_started:
         worker_started = True
-        threading.Thread(target=background_loop, daemon=True, name="spy-brain-loop").start()
+        threading.Thread(
+            target=background_loop, daemon=True, name="spy-brain-loop"
+        ).start()
 
 
 start_worker_once()
@@ -887,13 +1193,16 @@ def home():
             return jsonify({"status": "alive", "authenticated": False}), 200
 
     api_key, secret_key, _ = get_env_keys()
-    return jsonify(
-        {
-            "status": "SPY Autonomous Brain v9.2 (Stateless Production) is Alive!",
-            "keys_configured": bool(api_key and secret_key),
-            "live_dashboard": bot_state,
-        }
-    ), 200
+    return (
+        jsonify(
+            {
+                "status": "SPY Autonomous Brain v9.3.1 (MTF Pullback + VWAP Reclaim) is Alive!",
+                "keys_configured": bool(api_key and secret_key),
+                "live_dashboard": bot_state,
+            }
+        ),
+        200,
+    )
 
 
 @app.route("/webhook", methods=["POST"])
@@ -912,14 +1221,29 @@ def webhook():
     try:
         if signal in ("BUY_LONG", "BUY_SHORT"):
             pending_webhook = {"signal": signal, "ts": time.time()}
-            return jsonify({"status": f"Queued {signal} for bracketed entry on next scan"}), 200
+            return (
+                jsonify(
+                    {"status": f"Queued {signal} for bracketed entry on next scan"}
+                ),
+                200,
+            )
         if signal == "EXIT_POSITION":
             trade_client, _ = get_clients()
-            return jsonify({"status": flatten_position(trade_client, "Manual Webhook EXIT")}), 200
+            return (
+                jsonify(
+                    {"status": flatten_position(trade_client, "Manual Webhook EXIT")}
+                ),
+                200,
+            )
         if signal == "KILL":
             kill_switch = True
             trade_client, _ = get_clients()
-            return jsonify({"status": flatten_position(trade_client, "KILL Switch Activated")}), 200
+            return (
+                jsonify(
+                    {"status": flatten_position(trade_client, "KILL Switch Activated")}
+                ),
+                200,
+            )
         if signal == "RESUME":
             kill_switch = False
             return jsonify({"status": "Kill switch cleared; scanning resumed"}), 200
